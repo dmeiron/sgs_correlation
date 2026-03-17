@@ -503,7 +503,9 @@ def compute_all_fields(ux_h, uy_h, uz_h, kx, ky, kz, k2, N, delta, ftype):
     Cs = 0.17
     tau_smag_12 = -(2 * (Cs * delta) ** 2 * S_mag * S_12)
 
-    r = lambda a: a.ravel()
+    def r(a):
+        return a.ravel()
+
     return dict(
         u=r(fux),
         v=r(fuy),
