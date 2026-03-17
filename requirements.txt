@@ -1,0 +1,6 @@
+matplotlib==3.10.8
+mpi4py==4.1.1
+mpi4py_fft==2.0.6
+numpy==2.4.3
+pyfftw==0.15.1
+scipy==1.17.1
