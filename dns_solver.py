@@ -41,7 +41,7 @@ Outputs
   dns_fields.npz      — all derived fields (u_i, S_ij, Ω_ij, τ_ij, E(k))
                         compatible with sgs_conditional_pdf.py
   dns_energy.png      — E(k) with k^{-5/3} reference
-  dns_stats.png       — time history of TKE, ε, Re_λ, k_max η
+  dns_stats.png       — tinewDistArrayme history of TKE, ε, Re_λ, k_max η
   dns_slice.png       — mid-plane slices of |ω|, Q, |S|, |τ_12|
 
 Usage
@@ -67,7 +67,6 @@ Requirements
 
 import argparse
 import os
-import sys
 import time
 import multiprocessing
 import numpy as np
@@ -112,25 +111,25 @@ _N_THREADS = multiprocessing.cpu_count()
 
 def _fftn(a, **kw):
     if _USE_PYFFTW:
-        return _fft_mod.fftn(a, workers=_N_THREADS, **kw)
+        return _fft_mod.fftn(a,  **kw)
     return _fft_mod.fftn(a, **kw)
 
 
 def _ifftn(a, **kw):
     if _USE_PYFFTW:
-        return _fft_mod.ifftn(a, workers=_N_THREADS, **kw)
+        return _fft_mod.ifftn(a,  **kw)
     return _fft_mod.ifftn(a, **kw)
 
 
 def _rfftn(a, **kw):
     if _USE_PYFFTW:
-        return _fft_mod.rfftn(a, workers=_N_THREADS, **kw)
+        return _fft_mod.rfftn(a, **kw)
     return np.fft.rfftn(a, **kw)
 
 
 def _irfftn(a, s, **kw):
     if _USE_PYFFTW:
-        return _fft_mod.irfftn(a, s=s, workers=_N_THREADS, **kw)
+        return _fft_mod.irfftn(a, s=s,  **kw)
     return np.fft.irfftn(a, s=s, **kw)
 
 
