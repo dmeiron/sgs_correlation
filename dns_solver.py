@@ -794,6 +794,7 @@ def run_dns(
     history = dict(t=[], E=[], eps=[], Re_lam=[], k_max_eta=[])
     wall0 = time.time()
     next_diag = wall0
+    step_times = []  # per-step wall times
 
     st0 = compute_stats(ux_h, uy_h, uz_h, k2, nu, N)
     print(
@@ -812,9 +813,11 @@ def run_dns(
 
     while t < t_end:
         dt = min(adaptive_dt(ux_h, uy_h, uz_h, k2, N, nu, CFL), t_end - t + 1e-14)
+        _step_t0 = time.perf_counter()
         ux_h, uy_h, uz_h = rk3_step(
             ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, nu, dt, eps_target, k_f
         )
+        step_times.append(time.perf_counter() - _step_t0)
         t += dt
         step += 1
 
@@ -833,7 +836,18 @@ def run_dns(
             )
             next_diag = wall + diag_interval
 
-    print(f"\n  Done: {step} steps, {time.time() - wall0:.1f}s wall\n")
+    total_wall = time.time() - wall0
+    step_arr = step_times
+    mean_step = sum(step_arr) / len(step_arr) if step_arr else 0
+    min_step  = min(step_arr) if step_arr else 0
+    max_step  = max(step_arr) if step_arr else 0
+    print(
+        f"\n  Done: {step} steps,  total wall: {total_wall:.1f}s"
+        f"\n  Per-step RK3:  mean={mean_step*1e3:.2f}ms  "
+        f"min={min_step*1e3:.2f}ms  max={max_step*1e3:.2f}ms"
+        f"\n  Throughput:    {step/total_wall:.1f} steps/s  |  "
+        f"{N**3 * step / total_wall / 1e6:.1f} Mpts/s\n"
+    )
 
     stats = compute_stats(ux_h, uy_h, uz_h, k2, nu, N)
     k_sh, E_sh = energy_spectrum(ux_h, uy_h, uz_h, k2, N)
