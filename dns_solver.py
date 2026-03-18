@@ -41,7 +41,7 @@ Outputs
   dns_fields.npz      — all derived fields (u_i, S_ij, Ω_ij, τ_ij, E(k))
                         compatible with sgs_conditional_pdf.py
   dns_energy.png      — E(k) with k^{-5/3} reference
-  dns_stats.png       — tinewDistArrayme history of TKE, ε, Re_λ, k_max η
+  dns_stats.png       — time history of TKE, ε, Re_λ, k_max η
   dns_slice.png       — mid-plane slices of |ω|, Q, |S|, |τ_12|
 
 Usage
@@ -732,6 +732,7 @@ def run_dns(
     fields_out="dns_fields.npz",
     diag_interval=5.0,
     threads=None,
+    outdir=".",
 ):
     """
     Run DNS and save all derived fields.
@@ -871,9 +872,10 @@ def run_dns(
     np.savez_compressed(fields_out, **fields)
     print(f"  LES fields     -> {fields_out}")
 
-    plot_energy_spectrum(k_sh, E_sh, stats, N, nu)
-    plot_time_history(history)
-    plot_slice(ux_h, uy_h, uz_h, kx, ky, kz, k2, N, delta_les, filter_type)
+    import os as _os
+    plot_energy_spectrum(k_sh, E_sh, stats, N, nu, out=_os.path.join(outdir, "dns_energy.png"))
+    plot_time_history(history, out=_os.path.join(outdir, "dns_stats.png"))
+    plot_slice(ux_h, uy_h, uz_h, kx, ky, kz, k2, N, delta_les, filter_type, out=_os.path.join(outdir, "dns_slice.png"))
 
     print("\nComplete.\n")
     return fields, stats, history
@@ -913,6 +915,14 @@ if __name__ == "__main__":
     )
     a = p.parse_args()
 
+    # Build output directory from run parameters
+    from datetime import datetime
+    import os
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = f"run_{timestamp}_N{a.N:03d}_nu{a.nu:.0e}_T{int(a.T)}"
+    os.makedirs(outdir, exist_ok=True)
+    print(f"  Output directory: {outdir}/")
+
     run_dns(
         N=a.N,
         nu=a.nu,
@@ -924,7 +934,8 @@ if __name__ == "__main__":
         filter_type=a.filter,
         threads=a.threads,
         checkpoint_in=a.resume,
-        checkpoint_out=a.ckpt,
-        fields_out=a.out,
+        checkpoint_out=os.path.join(outdir, a.ckpt),
+        fields_out=os.path.join(outdir, a.out),
         diag_interval=a.diag,
+        outdir=outdir,
     )
