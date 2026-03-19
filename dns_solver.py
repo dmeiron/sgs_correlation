@@ -79,6 +79,9 @@ import matplotlib.pyplot as plt
 _USE_MPI = False
 _USE_PYFFTW = False
 
+
+_N_THREADS = multiprocessing.cpu_count()
+
 try:
     from mpi4py import MPI
     from mpi4py_fft import PFFT, newDistArray
@@ -95,18 +98,17 @@ if not _USE_MPI:
     try:
         import pyfftw
         import pyfftw.interfaces.numpy_fft as _fft_mod
-
+        pyfftw.config.NUM_THREADS = _N_THREADS
         pyfftw.interfaces.cache.enable()
         _USE_PYFFTW = True
     except ImportError:
         import numpy.fft as _fft_mod
-
         print(
             "Warning: pyfftw not found. Install with  pip install pyfftw  "
             "for 3–8x speedup (essential at N >= 256)."
         )
 
-_N_THREADS = multiprocessing.cpu_count()
+
 
 
 def _fftn(a, **kw):
@@ -225,40 +227,43 @@ def initial_condition(N, kx, ky, kz, k2, dealias, u_rms=1.0, k_peak=4, seed=42):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def nonlinear_and_force(ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, eps_target, k_f):
+def nonlinear_and_force(ux_h, uy_h, uz_h, kx, ky, kz, k2s, fmask, dealias, N6, S, eps_target):
     """
-    Returns -P[u.grad(u)] + F  in spectral space.
-    Nonlinear: pseudo-spectral with dealiasing.
-    Forcing:   linear at |k| <= k_f  (Lundgren 2003).
+    Returns -P[u x omega] + F  in spectral space.
+    Rotational form: 6 iFFTs vs 9 for u.grad(u).
+    k2s, fmask, N6, S are precomputed constants.
     """
-    S = (N, N, N)
+    # Velocity in physical space (3 iFFTs)
+    ux = _irfftn(ux_h * dealias, s=S)
+    uy = _irfftn(uy_h * dealias, s=S)
+    uz = _irfftn(uz_h * dealias, s=S)
 
-    ux = _irfftn(ux_h, s=S)
-    uy = _irfftn(uy_h, s=S)
-    uz = _irfftn(uz_h, s=S)
+    # u_max for CFL — free since we have physical velocities
+    u_max = float(max(np.abs(ux).max(), np.abs(uy).max(), np.abs(uz).max())) + 1e-10
 
-    def gp(uh, kd):  # gradient in physical space
-        return _irfftn(1j * kd * uh * dealias, s=S)
+    # Vorticity in physical space: omega = curl(u) (3 iFFTs)
+    ox = _irfftn(1j * (ky * uz_h - kz * uy_h) * dealias, s=S)
+    oy = _irfftn(1j * (kz * ux_h - kx * uz_h) * dealias, s=S)
+    oz = _irfftn(1j * (kx * uy_h - ky * ux_h) * dealias, s=S)
 
-    adv_x = ux * gp(ux_h, kx) + uy * gp(ux_h, ky) + uz * gp(ux_h, kz)
-    adv_y = ux * gp(uy_h, kx) + uy * gp(uy_h, ky) + uz * gp(uy_h, kz)
-    adv_z = ux * gp(uz_h, kx) + uy * gp(uz_h, ky) + uz * gp(uz_h, kz)
+    # u x omega in physical space
+    adv_x = uy * oz - uz * oy
+    adv_y = uz * ox - ux * oz
+    adv_z = ux * oy - uy * ox
 
+    # Forward FFT + dealias (3 FFTs)
     ax_h = (_rfftn(adv_x) * dealias).astype(np.complex64)
     ay_h = (_rfftn(adv_y) * dealias).astype(np.complex64)
     az_h = (_rfftn(adv_z) * dealias).astype(np.complex64)
 
-    k2s = np.where(k2 == 0, 1.0, k2)
+    # Helmholtz projection in spectral space
     kdota = kx * ax_h + ky * ay_h + kz * az_h
     nl_x = -(ax_h - kx * kdota / k2s)
     nl_y = -(ay_h - ky * kdota / k2s)
     nl_z = -(az_h - kz * kdota / k2s)
     nl_x[0, 0, 0] = nl_y[0, 0, 0] = nl_z[0, 0, 0] = 0.0
 
-    # linear forcing
-    km = np.sqrt(k2)
-    fmask = (km <= k_f) & (km > 0)
-    N6 = float(N**6)
+    # Linear forcing (Lundgren 2003)
     E_low = (
         0.5
         * float(
@@ -275,7 +280,7 @@ def nonlinear_and_force(ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, eps_target
     nl_y[fmask] += A * uy_h[fmask]
     nl_z[fmask] += A * uz_h[fmask]
 
-    return nl_x, nl_y, nl_z
+    return nl_x, nl_y, nl_z, u_max
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -287,16 +292,19 @@ _B = [1.0 / 3.0, 15.0 / 16.0, 8.0 / 15.0]
 _G = [1.0 / 3.0, 5.0 / 12.0, 1.0 / 4.0]  # sub-step fractions for IF
 
 
-def rk3_step(ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, nu, dt, eps_target, k_f):
+def rk3_step(ux_h, uy_h, uz_h, kx, ky, kz, k2, k2s, fmask, dealias, N, N6, S, nu, dt, eps_target):
     """Single low-storage RK3 step with exact viscous integrating factor."""
     px = np.zeros_like(ux_h)
     py = np.zeros_like(uy_h)
     pz = np.zeros_like(uz_h)
+    u_max_step = None
 
     for a, b, g in zip(_A, _B, _G):
-        nlx, nly, nlz = nonlinear_and_force(
-            ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, eps_target, k_f
+        nlx, nly, nlz, u_max = nonlinear_and_force(
+            ux_h, uy_h, uz_h, kx, ky, kz, k2s, fmask, dealias, N6, S, eps_target
         )
+        if u_max_step is None:
+            u_max_step = u_max
 
         px *= a
         px += nlx
@@ -317,7 +325,7 @@ def rk3_step(ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, nu, dt, eps_target, k
     ux_h *= dealias
     uy_h *= dealias
     uz_h *= dealias
-    return ux_h, uy_h, uz_h
+    return ux_h, uy_h, uz_h, u_max_step
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,13 +391,9 @@ def energy_spectrum(ux_h, uy_h, uz_h, k2, N):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def adaptive_dt(ux_h, uy_h, uz_h, k2, N, nu, CFL=0.4):
-    S = (N, N, N)
+def adaptive_dt(u_max, N, nu, CFL=0.4):
+    """CFL timestep from cached u_max — no FFTs needed."""
     dx = 2 * np.pi / N
-    ux = _irfftn(ux_h, s=S)
-    uy = _irfftn(uy_h, s=S)
-    uz = _irfftn(uz_h, s=S)
-    u_max = float(max(np.abs(ux).max(), np.abs(uy).max(), np.abs(uz).max())) + 1e-10
     return min(CFL * dx / u_max, 0.5 * dx**2 / (nu * np.pi**2))
 
 
@@ -548,7 +552,7 @@ def compute_all_fields(ux_h, uy_h, uz_h, kx, ky, kz, k2, N, delta, ftype):
 
 def plot_energy_spectrum(k_sh, E_sh, stats, N, nu, out="dns_energy.png"):
     fig, ax = plt.subplots(figsize=(8, 5.5))
-    ax.loglog(k_sh, E_sh, "steelblue", lw=2, label="DNS $E(k)$")
+    ax.loglog(k_sh, E_sh, "steelblue", lw=2, label="DNS E(k)")
 
     eta = stats["eta"]
     eps = stats["eps"]
@@ -560,7 +564,7 @@ def plot_energy_spectrum(k_sh, E_sh, stats, N, nu, out="dns_energy.png"):
             "tomato",
             lw=1.8,
             ls="--",
-            label=r"$C_K\varepsilon^{2/3}k^{-5/3}$",
+            label="Ck * eps^(2/3) * k^(-5/3)",
         )
 
     ax.axvline(
@@ -568,7 +572,7 @@ def plot_energy_spectrum(k_sh, E_sh, stats, N, nu, out="dns_energy.png"):
         color="#777",
         ls=":",
         lw=1.5,
-        label=rf"$k\eta=1$  $(k\approx{1 / eta:.0f})$",
+        label=rf"k*eta=1  (k~{1 / eta:.0f})",
     )
     ax.axvline(
         N // 3,
@@ -576,15 +580,13 @@ def plot_energy_spectrum(k_sh, E_sh, stats, N, nu, out="dns_energy.png"):
         ls="--",
         lw=1.2,
         alpha=0.6,
-        label=f"Dealiasing cutoff $k={N // 3}$",
+        label=f"Dealiasing cutoff k={N // 3}",
     )
 
-    ax.set_xlabel("Wavenumber $k$", fontsize=12)
-    ax.set_ylabel("$E(k)$", fontsize=12)
+    ax.set_xlabel("Wavenumber k", fontsize=12)
+    ax.set_ylabel("E(k)", fontsize=12)
     ax.set_title(
-        rf"DNS Energy Spectrum  —  $N={N}^3$,  $\nu={nu}$,  "
-        rf"$Re_{{\lambda}}={stats['Re_lam']:.0f}$,  "
-        rf"$k_{{max}}\eta={stats['k_max_eta']:.2f}$",
+        f"DNS Energy Spectrum  —  N={N}^3,  nu={nu},  Re_lam={stats['Re_lam']:.0f},  k_max*eta={stats['k_max_eta']:.2f}",
         fontsize=11,
     )
     ax.legend(fontsize=10)
@@ -606,18 +608,18 @@ def plot_time_history(history, out="dns_stats.png"):
     for ax, (d, lab, col) in zip(
         axes,
         [
-            (E, "TKE  $E$", "steelblue"),
-            (eps, r"Dissipation  $\varepsilon$", "tomato"),
-            (Re, r"$Re_\lambda$", "seagreen"),
-            (keta, r"Resolution  $k_{max}\eta$", "darkorange"),
+            (E, "TKE  E", "steelblue"),
+            (eps, "Dissipation  eps", "tomato"),
+            (Re, "Re_lambda", "seagreen"),
+            (keta, "Resolution  k_max*eta", "darkorange"),
         ],
     ):
         ax.plot(t, d, color=col, lw=1.8)
         ax.set_ylabel(lab, fontsize=11)
         ax.grid(True, alpha=0.25)
-    axes[3].axhline(1.0, color="k", ls="--", lw=1.2, label="$k_{max}\\eta=1$")
+    axes[3].axhline(1.0, color="k", ls="--", lw=1.2, label="k_max*eta=1")
     axes[3].legend(fontsize=9)
-    axes[3].set_xlabel("Time $t$", fontsize=11)
+    axes[3].set_xlabel("Time t", fontsize=11)
     fig.suptitle("DNS Time History", fontsize=13, fontweight="bold")
     fig.tight_layout()
     fig.savefig(out, dpi=160)
@@ -682,10 +684,10 @@ def plot_slice(ux_h, uy_h, uz_h, kx, ky, kz, k2, N, delta, ftype, out="dns_slice
 
     slices = [omega_mag[:, :, iz], Q[:, :, iz], Smag[:, :, iz], np.abs(tau12[:, :, iz])]
     titles = [
-        r"$|\omega|$ vorticity mag.",
-        r"$Q$-criterion  ($Q>0$: vortex)",
-        r"$|\bar{S}|$ filtered strain rate",
-        r"$|\tau_{12}|$ SGS stress",
+        "vorticity mag. |omega|",
+        "Q-criterion  (Q>0: vortex)",
+        "|S| filtered strain rate",
+        "|tau_12| SGS stress",
     ]
     cmaps = ["inferno", "RdBu_r", "viridis", "plasma"]
 
@@ -699,8 +701,8 @@ def plot_slice(ux_h, uy_h, uz_h, kx, ky, kz, k2, N, delta, ftype, out="dns_slice
             vmax=np.percentile(sl, 98),
         )
         ax.set_title(ti, fontsize=11)
-        ax.set_xlabel("$x$")
-        ax.set_ylabel("$y$")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
         plt.colorbar(im, ax=ax, shrink=0.85)
     fig.suptitle(
         f"Mid-plane slice  (z=N/2)  —  N={N}, Delta={delta:.3f}, {ftype} filter",
@@ -811,11 +813,24 @@ def run_dns(
     )
     print(f"  {'-' * 75}")
 
+    # Precompute constants used every step
+    k2s = np.where(k2 == 0, 1.0, k2).astype(np.float32)
+    km  = np.sqrt(k2)
+    fmask = (km <= k_f) & (km > 0)
+    N6  = float(N**6)
+    S   = (N, N, N)
+
+    # Bootstrap u_max for first step
+    _ux0 = _irfftn(ux_h, s=S)
+    _uy0 = _irfftn(uy_h, s=S)
+    _uz0 = _irfftn(uz_h, s=S)
+    u_max = float(max(np.abs(_ux0).max(), np.abs(_uy0).max(), np.abs(_uz0).max())) + 1e-10
+
     while t < t_end:
-        dt = min(adaptive_dt(ux_h, uy_h, uz_h, k2, N, nu, CFL), t_end - t + 1e-14)
+        dt = min(adaptive_dt(u_max, N, nu, CFL), t_end - t + 1e-14)
         _step_t0 = time.perf_counter()
-        ux_h, uy_h, uz_h = rk3_step(
-            ux_h, uy_h, uz_h, kx, ky, kz, k2, dealias, N, nu, dt, eps_target, k_f
+        ux_h, uy_h, uz_h, u_max = rk3_step(
+            ux_h, uy_h, uz_h, kx, ky, kz, k2, k2s, fmask, dealias, N, N6, S, nu, dt, eps_target
         )
         step_times.append(time.perf_counter() - _step_t0)
         t += dt
